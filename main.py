@@ -148,6 +148,16 @@ class FeePaymentCreate(BaseModel):
     description: Optional[str] = None
     year_id: int
 
+# NEW: Pydantic schema for retrieving academic year information
+class AcademicYearOut(BaseModel):
+    year_id: int
+    year_name: str
+    start_date: date
+    end_date: date
+    is_current: bool
+    class Config:
+        orm_mode = True
+
 class StudentDetails(BaseModel):
     student_id: int
     admission_number: str
@@ -157,9 +167,12 @@ class StudentDetails(BaseModel):
     class Config:
         orm_mode = True
 
+# UPDATED: StudentFeeSummary model to provide more detail
 class StudentFeeSummary(BaseModel):
     student_details: StudentDetails
     academic_year: str
+    current_year_fees_due: float
+    carry_forward_fees: float
     total_fees_due: float
     total_amount_paid: float
     pending_fees: float
@@ -316,7 +329,7 @@ def record_fee_payment(
         logger.warning(f"Fee payment failed: No annual fee record found for student ID {payment.student_id}, year ID {payment.year_id}.")
         raise HTTPException(status_code=404, detail=f"No fee record found for student for the specified academic year.")
 
-    total_fees_due = float(annual_fee_record.total_annual_fees)
+    current_year_fees_due = float(annual_fee_record.total_annual_fees)
     
     payments_made = db.query(Transaction).filter(
         Transaction.student_id == payment.student_id,
@@ -324,6 +337,15 @@ def record_fee_payment(
         Transaction.transaction_type == 'Fee Payment'
     ).all()
     total_amount_paid = sum(float(p.amount) for p in payments_made)
+
+    carry_forwards = db.query(Transaction).filter(
+        Transaction.student_id == payment.student_id,
+        Transaction.year_id == payment.year_id,
+        Transaction.transaction_type == 'Fee Carry Forward'
+    ).all()
+    carry_forward_fees = sum(float(cf.amount) for cf in carry_forwards)
+
+    total_fees_due = current_year_fees_due + carry_forward_fees
 
     if (total_amount_paid + payment.amount) > total_fees_due:
         logger.warning(f"Overpayment detected for student ID {payment.student_id}: Amount {payment.amount} exceeds pending fees of {total_fees_due - total_amount_paid}.")
@@ -353,6 +375,40 @@ def record_fee_payment(
         db.rollback()
         raise HTTPException(status_code=500, detail="An internal server error occurred.")
 
+# NEW: Endpoint to get a student by their admission number
+@app.get("/students/by-admission-no/{admission_no}", response_model=StudentDetails)
+def get_student_by_admission_no(admission_no: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    logger.info(f"User '{current_user.username}' is requesting student details for admission number: {admission_no}.")
+    student = db.query(Student).filter(Student.admission_number == admission_no).first()
+    if not student:
+        logger.warning(f"Student details request failed: Student with admission number {admission_no} not found.")
+        raise HTTPException(status_code=404, detail="Student not found")
+    
+    return StudentDetails(
+        student_id=student.student_id,
+        admission_number=student.admission_number,
+        full_name=f"{student.first_name} {student.last_name}",
+        status=student.status,
+        admission_date=student.admission_date
+    )
+
+# NEW: Endpoint to get academic year by its name
+@app.get("/academic-years/by-name/{year_name}", response_model=AcademicYearOut)
+def get_academic_year_by_name(year_name: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    logger.info(f"User '{current_user.username}' is requesting academic year details for name: {year_name}.")
+    academic_year = db.query(AcademicYear).filter(AcademicYear.year_name == year_name).first()
+    if not academic_year:
+        logger.warning(f"Academic year request failed: Year with name {year_name} not found.")
+        raise HTTPException(status_code=404, detail="Academic year not found")
+    
+    return AcademicYearOut(
+        year_id=academic_year.year_id,
+        year_name=academic_year.year_name,
+        start_date=academic_year.start_date,
+        end_date=academic_year.end_date,
+        is_current=academic_year.is_current
+    )
+
 @app.get("/students/{student_id}/details", response_model=StudentDetails)
 def get_student_details(student_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     logger.info(f"User '{current_user.username}' is requesting details for student ID: {student_id}.")
@@ -369,6 +425,7 @@ def get_student_details(student_id: int, db: Session = Depends(get_db), current_
         admission_date=student.admission_date
     )
 
+# UPDATED: This function now returns the detailed fee summary.
 @app.get("/students/{student_id}/fee-summary/{year_id}", response_model=StudentFeeSummary)
 def get_student_fee_summary(student_id: int, year_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     logger.info(f"User '{current_user.username}' is requesting fee summary for student ID: {student_id}, year ID: {year_id}.")
@@ -386,8 +443,18 @@ def get_student_fee_summary(student_id: int, year_id: int, db: Session = Depends
         logger.warning(f"Fee summary request failed: No annual fee record found for student ID {student_id}, year ID {year_id}.")
         raise HTTPException(status_code=404, detail=f"No fee record found for student for the specified academic year.")
 
-    total_fees_due = float(annual_fee_record.total_annual_fees)
+    # Base fees for the current year
+    current_year_fees_due = float(annual_fee_record.total_annual_fees)
     
+    # Calculate fees carried forward from previous years
+    carry_forwards = db.query(Transaction).filter(
+        Transaction.student_id == student_id,
+        Transaction.year_id == year_id,
+        Transaction.transaction_type == 'Fee Carry Forward'
+    ).all()
+    carry_forward_fees = sum(float(cf.amount) for cf in carry_forwards)
+
+    # Calculate total payments
     payments = db.query(Transaction).filter(
         Transaction.student_id == student_id,
         Transaction.year_id == year_id,
@@ -395,16 +462,11 @@ def get_student_fee_summary(student_id: int, year_id: int, db: Session = Depends
     ).all()
     total_amount_paid = sum(float(p.amount) for p in payments)
 
-    carry_forwards = db.query(Transaction).filter(
-        Transaction.student_id == student_id,
-        Transaction.year_id == year_id,
-        Transaction.transaction_type == 'Fee Carry Forward'
-    ).all()
-    total_carry_forward = sum(float(cf.amount) for cf in carry_forwards)
-
-    total_fees_due += total_carry_forward
+    # Calculate the final total and pending fees
+    total_fees_due = current_year_fees_due + carry_forward_fees
     pending_fees = total_fees_due - total_amount_paid
-    logger.info(f"Fee summary for student ID {student_id}, year ID {year_id}: Total due {total_fees_due}, Total paid {total_amount_paid}, Pending {pending_fees}.")
+
+    logger.info(f"Fee summary for student ID {student_id}, year ID {year_id}: Current Due {current_year_fees_due}, Carry Forward {carry_forward_fees}, Total Due {total_fees_due}, Total Paid {total_amount_paid}, Pending {pending_fees}.")
 
     student_details = StudentDetails(
         student_id=student.student_id,
@@ -417,6 +479,8 @@ def get_student_fee_summary(student_id: int, year_id: int, db: Session = Depends
     return StudentFeeSummary(
         student_details=student_details,
         academic_year=annual_fee_record.academic_year.year_name,
+        current_year_fees_due=round(current_year_fees_due, 2),
+        carry_forward_fees=round(carry_forward_fees, 2),
         total_fees_due=round(total_fees_due, 2),
         total_amount_paid=round(total_amount_paid, 2),
         pending_fees=round(pending_fees, 2)
