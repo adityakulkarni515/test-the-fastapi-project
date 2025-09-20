@@ -1,11 +1,11 @@
 import os
 import base64
 import pickle
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse, RedirectResponse
 from googleapiclient.discovery import build
-from google_auth_oauthlib.flow import InstalledAppFlow
-from google.auth.transport.requests import Request
+from google_auth_oauthlib.flow import Flow
+from google.auth.transport.requests import Request as GoogleRequest
 from google.cloud import storage
 import google.generativeai as genai
 
@@ -26,14 +26,18 @@ model = genai.GenerativeModel("gemini-1.5-flash")
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 
 # Cloud Storage for token storage
-GCS_BUCKET = os.getenv("GCS_BUCKET")  # set in Cloud Run env
+GCS_BUCKET = os.getenv("GCS_BUCKET")
 if not GCS_BUCKET:
     raise ValueError("❌ GCS_BUCKET not set in env variables")
+
+# OAuth config for Cloud Run
+REDIRECT_URI = os.getenv("REDIRECT_URI", "https://your-cloudrun-url.com/oauth/callback")
+CLIENT_SECRETS_FILE = "/secrets/gmail-client-secret.json"
 
 app = FastAPI()
 
 # -------------------------
-# Gmail authentication
+# Gmail authentication (Modified for Cloud Run)
 # -------------------------
 def get_token_path(user_email: str):
     return f"/tmp/token_{user_email}.pickle"
@@ -56,6 +60,41 @@ def upload_token_to_gcs(user_email: str):
     if os.path.exists(local_path):
         blob.upload_from_filename(local_path)
 
+def create_oauth_flow():
+    return Flow.from_client_secrets_file(
+        CLIENT_SECRETS_FILE,
+        scopes=SCOPES,
+        redirect_uri=REDIRECT_URI
+    )
+
+# OAuth routes
+@app.get("/oauth/start")
+def start_oauth():
+    flow = create_oauth_flow()
+    authorization_url, _ = flow.authorization_url(
+        access_type='offline',
+        include_granted_scopes='true'
+    )
+    return RedirectResponse(url=authorization_url)
+
+@app.get("/oauth/callback")
+def oauth_callback(request: Request):
+    try:
+        flow = create_oauth_flow()
+        flow.fetch_token(authorization_response=str(request.url))
+        
+        credentials = flow.credentials
+        user_email = "me"  # You might want to get actual email from credentials
+        
+        # Save token
+        with open(get_token_path(user_email), "wb") as token_file:
+            pickle.dump(credentials, token_file)
+        upload_token_to_gcs(user_email)
+        
+        return JSONResponse(content={"message": "Authentication successful! You can now use the API."})
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"OAuth error: {str(e)}")
+
 def authenticate_gmail(user_email="me"):
     creds = None
     local_token = download_token_from_gcs(user_email)
@@ -65,15 +104,22 @@ def authenticate_gmail(user_email="me"):
 
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
+            try:
+                creds.refresh(GoogleRequest())
+                # Save refreshed token
+                with open(get_token_path(user_email), "wb") as token_file:
+                    pickle.dump(creds, token_file)
+                upload_token_to_gcs(user_email)
+            except Exception:
+                raise HTTPException(
+                    status_code=401, 
+                    detail="Authentication expired. Please visit /oauth/start to re-authenticate."
+                )
         else:
-            flow = InstalledAppFlow.from_client_secrets_file(
-                "/secrets/gmail-client-secret.json", SCOPES
+            raise HTTPException(
+                status_code=401, 
+                detail="Not authenticated. Please visit /oauth/start to authenticate."
             )
-            creds = flow.run_local_server(port=0)
-        with open(get_token_path(user_email), "wb") as token_file:
-            pickle.dump(creds, token_file)
-        upload_token_to_gcs(user_email)
 
     return build("gmail", "v1", credentials=creds)
 
@@ -123,8 +169,12 @@ def summarize_email(email_text):
     return response.text
 
 # -------------------------
-# FastAPI route
+# FastAPI routes
 # -------------------------
+@app.get("/")
+def root():
+    return {"message": "Email Summarizer API", "auth_url": "/oauth/start"}
+
 @app.get("/summarize-emails")
 def summarize_emails(count: int = 5):
     try:
@@ -140,5 +190,7 @@ def summarize_emails(count: int = 5):
 
         return JSONResponse(content={"summaries": summaries})
 
+    except HTTPException:
+        raise
     except Exception as e:
         return JSONResponse(content={"error": str(e)}, status_code=500)
