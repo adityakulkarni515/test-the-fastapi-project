@@ -1,528 +1,104 @@
-# main.py
-# To run this app:
-# 1. Install necessary packages:
-#    pip install fastapi uvicorn sqlalchemy psycopg2-binary passlib[bcrypt] python-jose[cryptography] python-multipart python-dotenv
-#
-# 2. Create and set your environment variables in a .env file:
-#    SECRET_KEY="your_secure_random_string_here"
-#    DATABASE_URL="your_database_url_here"
-#
-# 3. Run the application:
-#    uvicorn main:app --reload
-
 import os
-from datetime import datetime, timedelta, date
-from typing import List, Optional
-import logging
-
-from fastapi import FastAPI, Depends, HTTPException, status
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from jose import JWTError, jwt
-from passlib.context import CryptContext
-from pydantic import BaseModel
-from sqlalchemy import create_engine, Column, Integer, String, Enum, Boolean, TIMESTAMP, ForeignKey, DECIMAL, Date, text
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session, relationship
-from sqlalchemy.exc import IntegrityError
+import base64
+import pickle
 from dotenv import load_dotenv
+import google.generativeai as genai
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+from googleapiclient.discovery import build
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
 
-
-
-# Load environment variables from .env file
+# Load .env
 load_dotenv()
+GENAI_API_KEY = os.getenv("GENAI_API_KEY")
+if not GENAI_API_KEY:
+    raise ValueError("❌ GENAI_API_KEY not found in .env file")
 
-# --- Logging Setup ---
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("uvicorn.error")
+# Gemini Config
+genai.configure(api_key=GENAI_API_KEY)
+model = genai.GenerativeModel("gemini-1.5-flash")
 
-# --- Configuration ---
-DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    logger.error("DATABASE_URL environment variable is not set")
-    raise ValueError("DATABASE_URL environment variable is not set")
+# Gmail API Config
+SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 
-SECRET_KEY = os.getenv("SECRET_KEY")
-if not SECRET_KEY:
-    logger.error("SECRET_KEY environment variable is not set")
-    raise ValueError("SECRET_KEY environment variable is not set")
+app = FastAPI()
 
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60
+def authenticate_gmail():
+    creds = None
+    if os.path.exists("token.pickle"):
+        with open("token.pickle", "rb") as token:
+            creds = pickle.load(token)
 
-# --- Database Setup (SQLAlchemy) ---
-engine = create_engine(DATABASE_URL)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
-
-# --- Password Hashing ---
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
-
-# --- SQLAlchemy Models (Mirrors your DB schema) ---
-
-class User(Base):
-    __tablename__ = "users"
-    user_id = Column(Integer, primary_key=True, index=True)
-    username = Column(String, unique=True, index=True, nullable=False)
-    password_hash = Column(String, nullable=False)
-    full_name = Column(String, nullable=False)
-    role = Column(Enum('Admin', 'Teaching Staff', 'Non-Teaching Staff', name='user_roles'), nullable=False)
-    is_active = Column(Boolean, default=True)
-    created_at = Column(TIMESTAMP, server_default=text('CURRENT_TIMESTAMP'))
-
-class Student(Base):
-    __tablename__ = "students"
-    student_id = Column(Integer, primary_key=True, index=True)
-    admission_number = Column(String, unique=True, index=True, nullable=False)
-    first_name = Column(String, nullable=False)
-    last_name = Column(String, nullable=False)
-    admission_date = Column(Date, nullable=False)
-    status = Column(Enum('Active', 'Inactive', 'Graduated', 'Withdrawn', name='student_status'), default='Active')
-    created_at = Column(TIMESTAMP, server_default=text('CURRENT_TIMESTAMP'))
-
-class AcademicYear(Base):
-    __tablename__ = "academic_years"
-    year_id = Column(Integer, primary_key=True, index=True)
-    year_name = Column(String, unique=True, nullable=False)
-    start_date = Column(Date, nullable=False)
-    end_date = Column(Date, nullable=False)
-    is_current = Column(Boolean, default=False)
-
-class StudentAnnualFee(Base):
-    __tablename__ = "student_annual_fees"
-    annual_fee_id = Column(Integer, primary_key=True, index=True)
-    student_id = Column(Integer, ForeignKey("students.student_id"))
-    year_id = Column(Integer, ForeignKey("academic_years.year_id"))
-    total_annual_fees = Column(DECIMAL(10, 2), nullable=False)
-    notes = Column(String)
-    student = relationship("Student")
-    academic_year = relationship("AcademicYear")
-
-class Transaction(Base):
-    __tablename__ = "transactions"
-    transaction_id = Column(Integer, primary_key=True, index=True)
-    transaction_type = Column(Enum('Fee Payment', 'Expense', 'Income', 'Fee Carry Forward', name='transaction_types'), nullable=False)
-    amount = Column(DECIMAL(10, 2), nullable=False)
-    transaction_date = Column(Date, nullable=False)
-    description = Column(String)
-    student_id = Column(Integer, ForeignKey("students.student_id"), nullable=True)
-    category = Column(String, nullable=True)
-    payment_method = Column(Enum('Cash', 'Bank Transfer', 'Online', 'Cheque', name='payment_methods'), nullable=True)
-    reference_details = Column(String, nullable=True)
-    recorded_by_user_id = Column(Integer, ForeignKey("users.user_id"))
-    year_id = Column(Integer, ForeignKey("academic_years.year_id"))
-    
-    student = relationship("Student")
-    recorded_by = relationship("User")
-    academic_year = relationship("AcademicYear")
-
-# --- Pydantic Schemas (for API input/output validation) ---
-
-class UserCreate(BaseModel):
-    username: str
-    password: str
-    full_name: str
-    role: str
-
-class UserOut(BaseModel):
-    user_id: int
-    username: str
-    full_name: str
-    role: str
-    class Config:
-        orm_mode = True
-
-class Token(BaseModel):
-    access_token: str
-    token_type: str
-
-class TokenData(BaseModel):
-    username: Optional[str] = None
-
-class FeePaymentCreate(BaseModel):
-    student_id: int
-    amount: float
-    transaction_date: date
-    payment_method: str
-    reference_details: Optional[str] = None
-    description: Optional[str] = None
-    year_id: int
-
-# NEW: Pydantic schema for retrieving academic year information
-class AcademicYearOut(BaseModel):
-    year_id: int
-    year_name: str
-    start_date: date
-    end_date: date
-    is_current: bool
-    class Config:
-        orm_mode = True
-
-class StudentDetails(BaseModel):
-    student_id: int
-    admission_number: str
-    full_name: str
-    status: str
-    admission_date: date
-    class Config:
-        orm_mode = True
-
-# UPDATED: StudentFeeSummary model to provide more detail
-class StudentFeeSummary(BaseModel):
-    student_details: StudentDetails
-    academic_year: str
-    current_year_fees_due: float
-    carry_forward_fees: float
-    total_fees_due: float
-    total_amount_paid: float
-    pending_fees: float
-
-class TransactionOut(BaseModel):
-    transaction_id: int
-    transaction_type: str
-    amount: float
-    transaction_date: date
-    description: Optional[str]
-    category: Optional[str]
-    student_id: Optional[int]
-    recorded_by: str
-    class Config:
-        orm_mode = True
-        
-# --- Dependency to get DB session ---
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-# --- Authentication & Authorization Functions ---
-def verify_password(plain_password, hashed_password):
-    return pwd_context.verify(plain_password, hashed_password)
-
-def get_password_hash(password):
-    return pwd_context.hash(password)
-
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
-    to_encode = data.copy()
-    if expires_delta:
-        expire = datetime.utcnow() + expires_delta
-    else:
-        expire = datetime.utcnow() + timedelta(minutes=15)
-    to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    return encoded_jwt
-
-async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        username: str = payload.get("sub")
-        if username is None:
-            logger.warning("Token validation failed: no username in payload")
-            raise credentials_exception
-        token_data = TokenData(username=username)
-    except JWTError:
-        logger.warning("Token validation failed: JWTError")
-        raise credentials_exception
-    user = db.query(User).filter(User.username == token_data.username).first()
-    if user is None:
-        logger.warning(f"Authentication failed: user '{token_data.username}' not found in database")
-        raise credentials_exception
-    
-    logger.info(f"User '{user.username}' successfully authenticated.")
-    return user
-
-# This dependency checks if the user has one of the allowed roles
-def check_user_role(allowed_roles: List[str]):
-    def role_checker(current_user: User = Depends(get_current_user)):
-        if current_user.role not in allowed_roles:
-            logger.warning(f"User '{current_user.username}' attempted to access protected endpoint without required role. Role: '{current_user.role}', Required: {allowed_roles}")
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"User does not have the required role. Allowed roles: {', '.join(allowed_roles)}"
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(
+                "client_secret.json", SCOPES
             )
-        return current_user
-    return role_checker
+            creds = flow.run_local_server(port=0)
+        with open("token.pickle", "wb") as token:
+            pickle.dump(creds, token)
 
-# --- FastAPI App Initialization ---
-app = FastAPI(title="School Finance API", description="API for managing school financial transactions.")
+    return build("gmail", "v1", credentials=creds)
 
-# --- API Endpoints ---
+def get_latest_emails(service, max_results=5):
+    results = service.users().messages().list(
+        userId="me",
+        maxResults=max_results,
+        labelIds=["INBOX"],
+        q="is:unread OR newer_than:7d"
+    ).execute()
 
-@app.post("/signup", response_model=UserOut, status_code=status.HTTP_201_CREATED)
-def create_user(
-    user: UserCreate, 
-    db: Session = Depends(get_db),
-    current_user: User = Depends(check_user_role(['Admin']))
-):
-    logger.info(f"Admin '{current_user.username}' is attempting to create new user '{user.username}' with role '{user.role}'")
-    hashed_password = get_password_hash(user.password)
-    db_user = User(
-        username=user.username,
-        password_hash=hashed_password,
-        full_name=user.full_name,
-        role=user.role
-    )
+    messages = results.get("messages", [])
+    email_texts = []
+
+    for msg in messages:
+        txt = service.users().messages().get(userId="me", id=msg["id"]).execute()
+        payload = txt["payload"]
+
+        data = None
+        if "parts" in payload:
+            for part in payload["parts"]:
+                if part["mimeType"] == "text/plain":
+                    data = part["body"].get("data")
+                    break
+        else:
+            data = payload["body"].get("data")
+
+        if data:
+            text = base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
+            email_texts.append(text[:4000])
+    return email_texts
+
+def summarize_email(email_text):
+    prompt = f"""
+    Summarize this email in structured format:
+    - Summary
+    - Key details
+    - Action items (if any)
+
+    Email:
+    {email_text}
+    """
+    response = model.generate_content(prompt)
+    return response.text
+
+@app.get("/summarize-emails")
+def summarize_emails(count: int = 5):
     try:
-        db.add(db_user)
-        db.commit()
-        db.refresh(db_user)
-        logger.info(f"Successfully created new user '{db_user.username}' (ID: {db_user.user_id})")
-    except IntegrityError:
-        db.rollback()
-        logger.warning(f"Failed to create user '{user.username}': username already registered.")
-        raise HTTPException(status_code=400, detail="Username already registered")
+        service = authenticate_gmail()
+        emails = get_latest_emails(service, count)
+
+        summaries = []
+        for i, email_text in enumerate(emails, 1):
+            summaries.append({
+                "email_number": i,
+                "summary": summarize_email(email_text)
+            })
+
+        return JSONResponse(content={"summaries": summaries})
+
     except Exception as e:
-        logger.exception(f"An unexpected error occurred while creating user '{user.username}': {e}")
-        db.rollback()
-        raise HTTPException(status_code=500, detail="An internal server error occurred.")
-
-    return db_user
-
-@app.post("/login", response_model=Token)
-async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.username == form_data.username).first()
-    if not user or not verify_password(form_data.password, user.password_hash):
-        logger.warning(f"Failed login attempt for username: '{form_data.username}'")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect username or password",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    access_token = create_access_token(
-        data={"sub": user.username}, expires_delta=access_token_expires
-    )
-    logger.info(f"User '{user.username}' successfully logged in.")
-    return {"access_token": access_token, "token_type": "bearer"}
-
-@app.post("/transactions/fee-payment", status_code=status.HTTP_201_CREATED)
-def record_fee_payment(
-    payment: FeePaymentCreate,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    logger.info(f"User '{current_user.username}' is attempting to record a payment of {payment.amount} for student ID: {payment.student_id}, year ID: {payment.year_id}.")
-    
-    student = db.query(Student).filter(Student.student_id == payment.student_id).first()
-    if not student:
-        logger.warning(f"Fee payment failed: Student with ID {payment.student_id} not found.")
-        raise HTTPException(status_code=404, detail="Student not found")
-    
-    year = db.query(AcademicYear).filter(AcademicYear.year_id == payment.year_id).first()
-    if not year:
-        logger.warning(f"Fee payment failed: Academic year with ID {payment.year_id} not found.")
-        raise HTTPException(status_code=404, detail="Academic year not found")
-
-    annual_fee_record = db.query(StudentAnnualFee).filter(
-        StudentAnnualFee.student_id == payment.student_id,
-        StudentAnnualFee.year_id == payment.year_id
-    ).first()
-
-    if not annual_fee_record:
-        logger.warning(f"Fee payment failed: No annual fee record found for student ID {payment.student_id}, year ID {payment.year_id}.")
-        raise HTTPException(status_code=404, detail=f"No fee record found for student for the specified academic year.")
-
-    current_year_fees_due = float(annual_fee_record.total_annual_fees)
-    
-    payments_made = db.query(Transaction).filter(
-        Transaction.student_id == payment.student_id,
-        Transaction.year_id == payment.year_id,
-        Transaction.transaction_type == 'Fee Payment'
-    ).all()
-    total_amount_paid = sum(float(p.amount) for p in payments_made)
-
-    carry_forwards = db.query(Transaction).filter(
-        Transaction.student_id == payment.student_id,
-        Transaction.year_id == payment.year_id,
-        Transaction.transaction_type == 'Fee Carry Forward'
-    ).all()
-    carry_forward_fees = sum(float(cf.amount) for cf in carry_forwards)
-
-    total_fees_due = current_year_fees_due + carry_forward_fees
-
-    if (total_amount_paid + payment.amount) > total_fees_due:
-        logger.warning(f"Overpayment detected for student ID {payment.student_id}: Amount {payment.amount} exceeds pending fees of {total_fees_due - total_amount_paid}.")
-        raise HTTPException(
-            status_code=400,
-            detail=f"Payment amount of {payment.amount} exceeds pending fees of {total_fees_due - total_amount_paid}. Total fees due: {total_fees_due}, Total paid: {total_amount_paid}."
-        )
-
-    try:
-        new_transaction = Transaction(
-            transaction_type='Fee Payment',
-            amount=payment.amount,
-            transaction_date=payment.transaction_date,
-            description=payment.description,
-            student_id=payment.student_id,
-            payment_method=payment.payment_method,
-            reference_details=payment.reference_details,
-            recorded_by_user_id=current_user.user_id,
-            year_id=payment.year_id
-        )
-        db.add(new_transaction)
-        db.commit()
-        logger.info(f"Fee payment of {payment.amount} successfully recorded for student ID {payment.student_id}.")
-        return {"message": "Fee payment recorded successfully"}
-    except Exception as e:
-        logger.exception(f"An unexpected error occurred while recording fee payment for student ID {payment.student_id}: {e}")
-        db.rollback()
-        raise HTTPException(status_code=500, detail="An internal server error occurred.")
-
-# NEW: Endpoint to get a student by their admission number
-@app.get("/students/by-admission-no/{admission_no}", response_model=StudentDetails)
-def get_student_by_admission_no(admission_no: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    logger.info(f"User '{current_user.username}' is requesting student details for admission number: {admission_no}.")
-    student = db.query(Student).filter(Student.admission_number == admission_no).first()
-    if not student:
-        logger.warning(f"Student details request failed: Student with admission number {admission_no} not found.")
-        raise HTTPException(status_code=404, detail="Student not found")
-    
-    return StudentDetails(
-        student_id=student.student_id,
-        admission_number=student.admission_number,
-        full_name=f"{student.first_name} {student.last_name}",
-        status=student.status,
-        admission_date=student.admission_date
-    )
-
-# NEW: Endpoint to get academic year by its name
-@app.get("/academic-years/by-name/{year_name}", response_model=AcademicYearOut)
-def get_academic_year_by_name(year_name: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    logger.info(f"User '{current_user.username}' is requesting academic year details for name: {year_name}.")
-    academic_year = db.query(AcademicYear).filter(AcademicYear.year_name == year_name).first()
-    if not academic_year:
-        logger.warning(f"Academic year request failed: Year with name {year_name} not found.")
-        raise HTTPException(status_code=404, detail="Academic year not found")
-    
-    return AcademicYearOut(
-        year_id=academic_year.year_id,
-        year_name=academic_year.year_name,
-        start_date=academic_year.start_date,
-        end_date=academic_year.end_date,
-        is_current=academic_year.is_current
-    )
-
-@app.get("/students/{student_id}/details", response_model=StudentDetails)
-def get_student_details(student_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    logger.info(f"User '{current_user.username}' is requesting details for student ID: {student_id}.")
-    student = db.query(Student).filter(Student.student_id == student_id).first()
-    if not student:
-        logger.warning(f"Student details request failed: Student with ID {student_id} not found.")
-        raise HTTPException(status_code=404, detail="Student not found")
-    
-    return StudentDetails(
-        student_id=student.student_id,
-        admission_number=student.admission_number,
-        full_name=f"{student.first_name} {student.last_name}",
-        status=student.status,
-        admission_date=student.admission_date
-    )
-
-# UPDATED: This function now returns the detailed fee summary.
-@app.get("/students/{student_id}/fee-summary/{year_id}", response_model=StudentFeeSummary)
-def get_student_fee_summary(student_id: int, year_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    logger.info(f"User '{current_user.username}' is requesting fee summary for student ID: {student_id}, year ID: {year_id}.")
-    student = db.query(Student).filter(Student.student_id == student_id).first()
-    if not student:
-        logger.warning(f"Fee summary request failed: Student with ID {student_id} not found.")
-        raise HTTPException(status_code=404, detail="Student not found")
-
-    annual_fee_record = db.query(StudentAnnualFee).filter(
-        StudentAnnualFee.student_id == student_id,
-        StudentAnnualFee.year_id == year_id
-    ).first()
-
-    if not annual_fee_record:
-        logger.warning(f"Fee summary request failed: No annual fee record found for student ID {student_id}, year ID {year_id}.")
-        raise HTTPException(status_code=404, detail=f"No fee record found for student for the specified academic year.")
-
-    # Base fees for the current year
-    current_year_fees_due = float(annual_fee_record.total_annual_fees)
-    
-    # Calculate fees carried forward from previous years
-    carry_forwards = db.query(Transaction).filter(
-        Transaction.student_id == student_id,
-        Transaction.year_id == year_id,
-        Transaction.transaction_type == 'Fee Carry Forward'
-    ).all()
-    carry_forward_fees = sum(float(cf.amount) for cf in carry_forwards)
-
-    # Calculate total payments
-    payments = db.query(Transaction).filter(
-        Transaction.student_id == student_id,
-        Transaction.year_id == year_id,
-        Transaction.transaction_type == 'Fee Payment'
-    ).all()
-    total_amount_paid = sum(float(p.amount) for p in payments)
-
-    # Calculate the final total and pending fees
-    total_fees_due = current_year_fees_due + carry_forward_fees
-    pending_fees = total_fees_due - total_amount_paid
-
-    logger.info(f"Fee summary for student ID {student_id}, year ID {year_id}: Current Due {current_year_fees_due}, Carry Forward {carry_forward_fees}, Total Due {total_fees_due}, Total Paid {total_amount_paid}, Pending {pending_fees}.")
-
-    student_details = StudentDetails(
-        student_id=student.student_id,
-        admission_number=student.admission_number,
-        full_name=f"{student.first_name} {student.last_name}",
-        status=student.status,
-        admission_date=student.admission_date
-    )
-
-    return StudentFeeSummary(
-        student_details=student_details,
-        academic_year=annual_fee_record.academic_year.year_name,
-        current_year_fees_due=round(current_year_fees_due, 2),
-        carry_forward_fees=round(carry_forward_fees, 2),
-        total_fees_due=round(total_fees_due, 2),
-        total_amount_paid=round(total_amount_paid, 2),
-        pending_fees=round(pending_fees, 2)
-    )
-
-@app.get("/transactions/history", response_model=List[TransactionOut])
-def get_transaction_history(
-    start_date: date, 
-    end_date: date, 
-    db: Session = Depends(get_db), 
-    current_user: User = Depends(get_current_user)
-):
-    logger.info(f"User '{current_user.username}' is requesting transaction history from {start_date} to {end_date}.")
-    if start_date > end_date:
-        logger.warning(f"Transaction history request failed: start date {start_date} is after end date {end_date}.")
-        raise HTTPException(status_code=400, detail="Start date cannot be after end date.")
-    
-    try:
-        transactions = db.query(Transaction).join(User).filter(
-            Transaction.transaction_date >= start_date,
-            Transaction.transaction_date <= end_date
-        ).order_by(Transaction.transaction_date.desc()).all()
-        
-        result = []
-        for t in transactions:
-            result.append(TransactionOut(
-                transaction_id=t.transaction_id,
-                transaction_type=t.transaction_type,
-                amount=float(t.amount),
-                transaction_date=t.transaction_date,
-                description=t.description,
-                category=t.category,
-                student_id=t.student_id,
-                recorded_by=t.recorded_by.full_name
-            ))
-        logger.info(f"Found {len(result)} transactions between {start_date} and {end_date}.")
-        return result
-    except Exception as e:
-        logger.exception(f"An unexpected error occurred while fetching transaction history: {e}")
-        raise HTTPException(status_code=500, detail="An internal server error occurred.")
-
-@app.get("/")
-def read_root():
-    logger.info("Root endpoint was accessed.")
-    return {"message": "Welcome to the School Finance API"}
+        return JSONResponse(content={"error": str(e)}, status_code=500)
