@@ -33,29 +33,8 @@ if not GCS_BUCKET:
 # OAuth config for Cloud Run
 REDIRECT_URI = os.getenv("REDIRECT_URI", "https://your-cloudrun-url.com/oauth/callback")
 
-import tempfile
-from google.cloud import secretmanager
 
-GMAIL_SECRET_NAME = os.getenv("GMAIL_CLIENT_SECRET_JSON")  # e.g., projects/360415887046/secrets/gmail-client-secret:latest
-
-def get_client_secrets_file():
-    if not GMAIL_SECRET_NAME:
-        raise ValueError("❌ GMAIL_CLIENT_SECRET_JSON not set in env variables")
-    
-    client = secretmanager.SecretManagerServiceClient()
-    response = client.access_secret_version(request={"name": GMAIL_SECRET_NAME})
-    secret_json = response.payload.data.decode("UTF-8")
-    
-    # Save temporarily to /tmp so Flow.from_client_secrets_file() can read it
-    tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
-    tmp_file.write(secret_json.encode())
-    tmp_file.close()
-    
-    return tmp_file.name
-
-CLIENT_SECRETS_FILE = get_client_secrets_file()
-
-#CLIENT_SECRETS_FILE = "/secrets/gmail-client-secret.json"
+CLIENT_SECRETS_FILE = "/secrets/gmail-client-secret.json"
 
 app = FastAPI()
 
