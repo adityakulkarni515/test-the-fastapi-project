@@ -1,6 +1,6 @@
 venv/
 __pycache__/
 *.pyc
-token.pickle
+token_*.pickle
 client_secret.json
 .env
