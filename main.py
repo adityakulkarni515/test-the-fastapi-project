@@ -31,7 +31,7 @@ if not GCS_BUCKET:
     raise ValueError("❌ GCS_BUCKET not set in env variables")
 
 # OAuth config for Cloud Run
-REDIRECT_URI = os.getenv("REDIRECT_URI", "https://your-cloudrun-url.com/oauth/callback")
+REDIRECT_URI = os.getenv("REDIRECT_URI", "https://test-the-fastapi-project-360415887046.asia-south1.run.appoauth/callback")
 
 
 CLIENT_SECRETS_FILE = "/secrets/gmail-client-secret.json"
